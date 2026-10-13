@@ -1,0 +1,168 @@
+# Engineering facts — the numbers that make an edit look/sound professional
+
+Mined 2026-07-30 from OpenMontage (AGPL — knowledge only, never code), the commercial
+market, editing-craft sources and the open-source landscape. **Parameters and algorithms
+are facts, not expression: reimplementing them is legitimate.** Anything that is somebody's
+creative design (a palette, a specific card layout) is excluded on purpose.
+
+Each entry: the value, why it works, where it lives in our code.
+
+## Sound
+
+| Fact | Value | Why | Ours |
+|---|---|---|---|
+| Ducking is **gentle sidechain compression**, not a volume dip | `sidechaincompress=threshold=0.05:ratio=2:attack=20:release=700:level_sc=1:mix=0.9`; speech `asplit`s into a play branch and a key branch | Music yields by roughly 2–6 dB while speech remains present; the bed must not disappear between phrases | `tools/sound.py` |
+| Notch the bed in the **speech band** | `equalizer=f=3000:width_type=o:width=1.6:g=-4` | Intelligibility is won by vacating 2–4 kHz, not by lowering level. Three separate sources call this the single most important mix rule | `tools/sound.py` |
+| Music sits **~20 dB under dialogue** | `-20 dB` | W3C accessibility floor for foreground speech; broadcast practice pulls a little more | `_MUSIC_GAIN_DB` |
+| SFX **lands before its beat** | −15 ms | Hearing is faster than seeing; a hit on the exact frame reads as late | `_sfx_delay_ms` |
+| SFX level | −12…−18 dB, always ≥6 dB under dialogue | Present without competing | `_SFX_GAIN_DB` |
+| `amix` needs `normalize=0` | — | Otherwise every extra layer silently attenuates the dialogue ~6 dB | `tools/sound.py` |
+| Fade **before** any delay/trim | — | Fading after a delay fades the silence, not the audio | `tools/sound.py` |
+| Loudness is set **once**, at the last audio step | −14 LUFS / −1.5 dBTP + true-peak limiter | Normalising mid-chain and again at the end puts dialogue through two rounds of dynamic compression | `tools/render.py` |
+| …and it is measured before it is applied | pass 1 `loudnorm …:print_format=json` → pass 2 with `measured_*` + `linear=true` | One-pass loudnorm guesses the programme level as it goes and rides the gain; handed the measurement it becomes a straight linear shift. ffmpeg falls back to the dynamic mode by itself when the source cannot reach the target linearly | `_loudnorm_filter` |
+| Mid-chain levelling is a **plain gain**, never loudnorm | peak → −1 dBFS (skipped under 0.5 dB) | Branch A's cut threshold is 0.14 of FULL SCALE, so it only lands right on a recording brought to a known level; a linear gain does that and leaves the voice's dynamics alone. Fixed 2026-08-03 — this row used to document the double loudnorm as intentional | `_levelling_gain` in `tools/normalize.py` |
+| Stock beds open sparse | pick the loudest window by `ebur128` momentary + sliding average | A bed that starts on the quiet intro sounds like it is still loading | `_best_segment` |
+
+## Cutting
+
+| Fact | Value | Why | Ours |
+|---|---|---|---|
+| Silence detection | auto-editor `audio:threshold=0.14` — a fraction of FULL SCALE, not of the file's peak | Measured 2026-08-03: `auto-editor levels` gives 0.768 for a clip and 0.0768 for the same clip 20 dB down, so the level scales with the signal. Hence the levelling step upstream — the same clip 20 dB down cuts to "Timeline is empty", and with the gain restored cuts identically to the original | `tools/cut_silence.py` + `_levelling_gain` |
+| Keep padding around a cut | 0.08–0.12 s each side | Prevents clipped word heads/tails | `cut_silence` margins |
+| Merge micro-gaps | drop segments <0.01 s; merge gaps <0.05 s | Otherwise the concat stutters | — |
+| Dead air | trim >1.5 s down to ~0.5 s | Below that it reads as natural breathing | agent rule |
+| **Protect breaths** | 0.3–0.8 s pauses are meaning, not dead air | Cutting them is the classic robotic tell | agent rule |
+| Filler removal is **transcript-driven**, not level-driven | word-level timestamps → cut word spans | Amplitude cannot tell "эм" from a word | D11: agent writes `edl.json` |
+| **A `.en` model does not refuse other languages — it TRANSLATES them** | block `*.en` unless `language == "en"` | The failure that looks like success: fluent English captions over Russian audio | `_check_language` |
+| Hallucinations over silence are caught by the **model's own confidence**, not by pattern | drop when `no_speech_prob > 0.6` AND `avg_logprob < -1.0` (Whisper's own decoding thresholds) | "Подписывайтесь на канал" and "СИГНАЛ СМС" are ordinary Russian — no regex finds them. Whisper already knows it heard nothing | `_why_invented` |
+| `♪` / `�` anywhere in a segment | drop the whole segment | Part of it was never decoded, so none of it is trustworthy | `_why_invented` |
+| >20 % of segments junk | **fail the run**, don't filter | A transcript that hallucinated that much hallucinated where nobody is looking too — re-run larger | `_drop_hallucinations` |
+| Brand terms need a **dictionary**, not a bigger model | `assets/brand/asr_fixes.yaml`, phrase-aware, punctuation-preserving | Whisper has never heard "ИИмерсивный". A misspelled brand term in a caption is the loudest amateur signal there is | `_apply_fixes` |
+| Scene detection | PySceneDetect `content` @ 27.0 (talking head 22, screencast 30); ffmpeg fallback `select='gt(scene,0.3)'` — note the different scales | Per-scene processing of long footage | not yet |
+| Speed ramps | `setpts=(1/f)*PTS` + chained `atempo` (valid 0.5–100, chain beyond) | Boilerplate typing 2–3×, installs 2–4× | not yet |
+
+## Transitions — punctuation, not decoration
+
+Built as `tools/transitions.py` (the clip-assembly capability we previously did by hand).
+
+| Fact | Value | Why |
+|---|---|---|
+| Three kinds only | `cut` / `crossfade` (`xfade=fade`) / `fade` (`xfade=fadeblack`) | A different transition at every join reads as a demo of the software |
+| **Discipline** | one kind on ≥60 % of joins (judged from 3 joins up) | `_check_discipline` refuses a scattered timeline |
+| Length by runtime | <60 s → 0.4 s · 1–10 min → 0.75 s · >10 min → 1.2 s | A short wants a quick dissolve; a long talk can breathe |
+| **Accumulating offset** | `offset_i = (length composed so far) − d_i` | Every transition SHORTENS the timeline. Summing raw durations drifts a little more at every seam |
+| Room | a transition may not exceed **half** the shorter clip | Fitting ≠ working: a dissolve eating most of a shot means the shot was never on screen |
+| Silent clips | force `anullsrc` in | `acrossfade`/`concat` break on a clip with no audio — exactly what a HyperFrames title card is |
+| Hard cut inside a blended chain | one-frame dissolve | A uniform graph is worth the single invisible frame; all-cut timelines use `concat` and stay exact |
+| Anti-pattern | exit and entrance animate at the same instant T | No exit animation before the transition begins (except the last scene) |
+
+## Rhythm and structure (the craft that reads as "an editor did this")
+
+- **J/L cuts**: our usual case gets them free. A full-frame cutaway is burned by `overlays`,
+  which never touches `0:a` — narration runs straight through while the picture changes. That
+  IS an L-cut. For pieces carrying separate sound, `transitions` takes `audio_duration` longer
+  than the picture's, so the sound arrives first.
+- **Cuts per minute by genre**: educational 3–5, vlog 6–10, comedy/gaming 10–20. The 2026 shift
+  is that *varying* the rate matters more than hitting a number — a constant pace fatigues.
+- **Pace follows the arc**: a target CPM per semantic block (hook fast, explanation by meaning),
+  not one rate for the whole video.
+- **Hook**: 0–5 s pattern interrupt, 5–15 s payoff of the promise, 15–30 s open the loop. The
+  real deadline is 15 s — the steepest retention drop is seconds 10–20.
+- **Open loops**: 2–3 per video, close one before opening the next.
+- **Pattern interrupt** every 60–90 s; chapters from ~8 min.
+- **B-roll doctrine**: ~60/40 A-roll/B-roll; never cut to a *single* insert — group 3+; hold
+  2–5 s; return to the face on a new beat, never mid-phrase.
+- **Show-don't-tell redundancy is the amateur tell**: an image that literally repeats the noun
+  just spoken adds nothing. Ban it.
+- **One text layer at a time** — enforced in `tools/storyboard.py`.
+- **Stagger**: `min(0.06 s, 0.5 / item_count)` — a group must finish arriving within ~0.5 s.
+- **Holds**: fade 0.3–0.5 s; entrance 0.5–1.0 s; count-up 1.2–1.6 s then hold; a chart needs
+  2–4 s to build **plus 3–5 s to be read** before you cut away.
+- **Label after value** on a stat card — the number lands, then its meaning.
+
+## Screencast (our second footage type)
+
+| Fact | Value |
+|---|---|
+| Record 4K, deliver 1080p | the 2× headroom is what makes a punch-in stay sharp |
+| FPS | 30 for static code, **60 for scrolling/UI motion** |
+| Zoom by target | terminal/code 1.5–2.2×, small button 2.0–3.0×, modal 1.4–2.0×, full page 1.0–1.3× |
+| Zoom timing | 0.6–0.8 s ease; **hold ≥3 s** before the next move |
+| Jump-cut mask | a 1.0→1.02× nudge on the cut hides the seam |
+| Cursor | 1.5–2× size, ~50 px highlight ring, pause 0.5 s on target before clicking |
+| IDE before recording | font 18–22 px, zoom 150–175 %, minimap off, sidebar collapsed |
+| Attention cues | max **2** at once; appear just before the action, clear right after |
+| Screencast loudness | −16 LUFS (gentler than −14 for long sessions) + 80 Hz HPF for keyboard rumble |
+
+## Quality gates — the mechanism that blocks a boring edit
+
+The most valuable idea found. Score the PLAN before rendering and refuse the render:
+
+- **Slideshow risk** (0–5, six weighted dimensions): dominant scene type >70 %; unique-description
+  ratio <60 %; shot-size repetition >60 %; visuals with no stated role; motion without intent;
+  **>60 % of scenes being text cards → "this feels like animated slides"**. ≥4 = fail.
+- **Variation**: ≥3 consecutive identical shot sizes; >50 % shot-size repetition; no hero moment;
+  generic filler wording.
+- **Motion ratio**: a promise like "motion-led" requires ≥70 % real motion — and text/stat cards
+  explicitly **do not count** as motion.
+- **Source review**: refuse to mark footage "reviewed" without an actual probe having run.
+
+**Built** as `_thin_spots` in `tools/storyboard.py`: dead stretch >90 s (the
+pattern-interrupt ceiling), text share >60 %, unique-caption ratio <60 %, >2 identical
+zooms in a row. Raises unless `allow_thin=True`.
+
+## The file gate — what a broken render actually looks like
+
+`tools/qc.py`, last step of the pipeline. Measuring (`_probe`) and judging (`_judge`)
+are separate so every rule is testable without a media file.
+
+| Check | Value | Why this number |
+|---|---|---|
+| Probe positions | 10 / 35 / 65 / 90 % | Not 0/100 % — a fade-in and an end card are black **by design** |
+| Black frame | mean luma **< 20** | **Not 16.** Video is limited-range, where pure black is Y=16 *exactly*, so `< 16` never fires. Measured: `#000000`→16, brand `#0B0B0C`→26, `#0B0F0E`→28 |
+| Silence | `mean_volume < −60 dBFS` | A full-length track that plays nothing |
+| Clipping | `max_volume > −0.5 dBFS` | Peaks into the ceiling |
+| Duration drift | >25 % vs the render's own input | An encode must not change the runtime it was handed |
+| Partial decode | fewer frames returned than positions probed | Damage mid-file |
+
+Measured on our own bench: black+silent → 5 blocking issues; a 30 dB-hot sine → `clipping: peak 0.0 dBFS`; the real dogfood render → pass.
+
+Deliberately **not** copied from OpenMontage: their file-size proxy (`<2000 bytes` = black)
+is fragile, and their `fail` status comes from grepping issue text for six phrases, so black
+frames and clipping don't actually block. Ours is an explicit boolean checklist.
+
+## HyperFrames — how a graphic reaches our timeline
+
+The design rule first: **the graphic renders WITH ALPHA and WE composite it.** Letting a
+composition embed the speaker video puts the graphics on HyperFrames' clock while every
+burned layer (zooms, inserts, subtitles) runs on the video's own clock. Two timebases in
+one frame is how a caption lands half a second off its word — and it fails silently.
+
+| Fact | Detail |
+|---|---|
+| `render` takes a project **DIRECTORY** | A file path fails with "Not a directory". A specific file goes through `--composition <name>`, relative to the directory. `_resolve` handles both |
+| Alpha needs `--format mov` | ProRes 4444, `yuva444p12le`. Default `mp4` is opaque; `--format webm` came out yuv420p here — also opaque. `png-sequence` writes RGBA |
+| **`npx` is `npx.cmd` on Windows** | `subprocess` without a shell only auto-appends `.exe`, so passing the bare name raises a FileNotFoundError that reads like Node is missing. Use the path `shutil.which` returned. This is why `motion` never once ran |
+| `--strict-variables` always | Without it a misspelled variable name renders a BLANK card instead of failing |
+| Pass variables by **file** | `--variables-file`; inline JSON loses its braces to the Windows shell |
+| Match `--fps` to the footage | A graphic rendered at a different rate judders once composited |
+| Verifying alpha | `alphaextract,signalstats` → 12-bit limited range: **256 = transparent, 3760 = opaque**. Our lower-third measured min 256 / avg 271 / max 3760 (mostly empty, graphic opaque); a full-bleed title card measured a uniform 3760 |
+| NVENC refuses `-g 1` | Use libx264 for all-intra intermediates bound for HyperFrames |
+
+## Libraries worth adopting (permissive only)
+
+MediaPipe (Apache-2.0, face/pose → safe zones, reframe) · PySceneDetect (BSD-3) ·
+Silero VAD (MIT, precise speech/non-speech) · WhisperX align (BSD-2, better word timings) ·
+DeepFilterNet (MIT/Apache, denoise) · librosa (ISC, beat detection) · pyannote (MIT, diarization).
+
+**Never**: Ultralytics YOLO (AGPL — MediaPipe covers it), essentia/aubio (AGPL/GPL — librosa
+covers it), madmom & InsightFace *weights* (non-commercial), Remotion (paid for automation —
+HyperFrames covers it), Blender bpy (GPL).
+
+## Handing an edit to a human
+
+Zoom keyframes do **not** survive interchange: OTIO does not standardise transforms, Premiere
+cannot read modern FCPXML, Resolve's FCPXML import is version-fragile. So: export clean cut
+structure (OTIO/EDL — both import natively, Resolve Free included) **plus** a readable zoom
+sheet, instead of gambling on a fragile effect round-trip. Resolve's scripting API needs paid
+Studio and cannot even retime — not an engine, only an export target.

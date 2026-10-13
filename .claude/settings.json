@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0; mkdir -p ~/.cache; nohup bash \"$CLAUDE_PROJECT_DIR/scripts/setup-session.sh\" >> ~/.cache/skills-setup.log 2>&1 & echo 'Skills toolchain (graft, chatmonteur) is installing in the background; log: ~/.cache/skills-setup.log'"
+          }
+        ]
+      }
+    ]
+  }
+}
